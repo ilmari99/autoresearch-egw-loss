@@ -220,7 +220,7 @@ class EGWConfig:
     # degenerate eigenspectrum (feature warm-start returns uniform there and
     # mirror descent sits on the uniform fixed point). Mirror descent can
     # diverge from diag(μ) if the codes are actually different.
-    identity_init: bool = True
+    identity_init: bool = False
     # Include an extra restart seeded by OT on sorted-Gram-row fingerprints.
     # On point-transitive codes the scalar structural features collapse, but
     # the full sorted row of G is permutation-invariant per point and distinct
@@ -333,7 +333,8 @@ def _sorted_row_match_plan(
     T0 = T0 * fm2
     log_T0 = torch.where(fm2 > 0, (T0 + 1e-30).log(),
                          torch.full_like(T0, LOG_ZERO))
-    K_init = -M_ws / epsilon + log_T0
+    eps_bcast = epsilon.view(-1, 1, 1) if isinstance(epsilon, torch.Tensor) else epsilon
+    K_init = -M_ws / eps_bcast + log_T0
     log_mu = torch.where(mu > 0, mu.log(), torch.full_like(mu, LOG_ZERO))
     log_nu = torch.where(nu > 0, nu.log(), torch.full_like(nu, LOG_ZERO))
     log_T = _sinkhorn_log(K_init, log_mu, log_nu, max_inner)
@@ -443,7 +444,8 @@ def _warmstart_plan(
     log_T0 = torch.where(fm2 > 0, (T0 + 1e-30).log(),
                          torch.full_like(T0, LOG_ZERO))
     noise = _symmetry_break_noise(fm2, symmetry_break, symmetry_break_seed)
-    K_init = -M_ws / epsilon + log_T0 + noise
+    eps_bcast = epsilon.view(-1, 1, 1) if isinstance(epsilon, torch.Tensor) else epsilon
+    K_init = -M_ws / eps_bcast + log_T0 + noise
     log_mu = torch.where(mu > 0, mu.log(), torch.full_like(mu, LOG_ZERO))
     log_nu = torch.where(nu > 0, nu.log(), torch.full_like(nu, LOG_ZERO))
     log_T = _sinkhorn_log(K_init, log_mu, log_nu, max_inner)
@@ -479,7 +481,8 @@ def _egw_solve_one_scale(
         T_prev = T
         LT = tensor_product_batch(L, T, nx=nx,
                                   recompute_const=False, symmetric=True)
-        K = -2.0 * LT / epsilon + log_T
+        eps_bcast = epsilon.view(-1, 1, 1) if isinstance(epsilon, torch.Tensor) else epsilon
+        K = -2.0 * LT / eps_bcast + log_T
         # Mask-out padded entries in K before projection so Sinkhorn cannot
         # leak mass to them.
         K = torch.where(fm2 > 0, K, torch.full_like(K, LOG_ZERO))
@@ -534,25 +537,35 @@ def solve_egw_plan(
         L = tensor_batch(mu, nu, D2_p, D2_t,
                          symmetric=True, nx=nx, loss='sqeuclidean')
 
-        # Cost scale from valid entries only.
-        nz_p = fm_pp > 0
-        nz_t = fm_tt > 0
-        d_vals = torch.cat([D2_p[nz_p], D2_t[nz_t]])
-        if d_vals.numel() == 0:
-            cost_scale = torch.tensor(1.0, device=G.device, dtype=G.dtype)
-        else:
-            cost_scale = d_vals.median().clamp(min=1e-8)
-        eps_final = float((cfg.epsilon_rel * cost_scale).clamp(
+        # Per-sample cost scale: each batch element uses its own D² median so
+        # that epsilon is independent of batch composition (batch invariance).
+        B = G.shape[0]
+        cs_list = []
+        for b in range(B):
+            nzp = fm_pp[b] > 0
+            nzt = fm_tt[b] > 0
+            parts = []
+            if nzp.any():
+                parts.append(D2_p[b][nzp])
+            if nzt.any():
+                parts.append(D2_t[b][nzt])
+            cs = (torch.cat(parts).median().clamp(min=1e-8)
+                  if parts else G.new_tensor(1.0))
+            cs_list.append(cs)
+        cs_tensor = torch.stack(cs_list)                         # (B,)
+        cost_scale = cs_tensor.median()                          # scalar for reporting
+        eps_vec = (cfg.epsilon_rel * cs_tensor).clamp(
             min=cfg.epsilon_abs_min, max=cfg.epsilon_abs_max
-        ))
+        )                                                        # (B,)
+        eps_final = float(eps_vec.median())
 
-        # Annealing schedule: eps_start * eps_final -> eps_final
+        # Annealing schedule: list of (B,) tensors eps_start → eps_final
         if cfg.eps_anneal_steps <= 1:
-            eps_schedule = [eps_final]
+            eps_schedule = [eps_vec]
         else:
             ratios = torch.linspace(cfg.eps_anneal_start, 1.0,
                                     cfg.eps_anneal_steps).tolist()
-            eps_schedule = [float(r * eps_final) for r in ratios]
+            eps_schedule = [eps_vec * r for r in ratios]
 
         eps0 = eps_schedule[0]
 
@@ -586,7 +599,6 @@ def solve_egw_plan(
         # we additionally seed one restart from T = diag(μ) at the sharp eps
         # (no anneal ramp, which would melt a sharp prior back to uniform).
         n_restarts = max(1, int(cfg.n_restarts))
-        B = G.shape[0]
         best_T, best_log_T = None, None
         best_val = None
         total_iters = 0
@@ -606,9 +618,8 @@ def solve_egw_plan(
                 total_iters += n_iter
             return T, log_T
 
-        # Early-exit threshold: value << cost_scale² means the plan is already
-        # essentially optimal — no point running more restarts.
-        exit_threshold = cfg.early_exit_rel * float(cost_scale) ** 2
+        # Per-sample early-exit threshold: value << cost_scale² ≈ optimal.
+        exit_threshold = cfg.early_exit_rel * cs_tensor ** 2    # (B,)
 
         def _record(T, log_T, val=None):
             nonlocal best_T, best_log_T, best_val
@@ -625,7 +636,7 @@ def solve_egw_plan(
 
         def _all_done():
             return best_val is not None and bool(
-                (best_val.abs() < exit_threshold).all().item()
+                (best_val.abs() < exit_threshold.to(best_val.device)).all().item()
             )
 
         # Try the cheap single-stage inits first (identity, sorted-row) — they
@@ -676,8 +687,9 @@ def solve_egw_plan(
             L_stk = tensor_batch(mu_stk, nu_stk, D2_p_stk, D2_t_stk,
                                   symmetric=True, nx=nx, loss='sqeuclidean')
 
+            eps_schedule_stk = [e.repeat(K) for e in eps_schedule]
             T_stk, log_T_stk = _run_schedule(
-                T_stk, log_T_stk, eps_schedule,
+                T_stk, log_T_stk, eps_schedule_stk,
                 L_stk, mu_stk, nu_stk, fm2_stk,
             )
 
