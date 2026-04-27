@@ -37,8 +37,6 @@ uv run test.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
-Before starting the autonomous keep/discard loop, make sure the retargeted loss-harness files are tracked by git and the repo is in a state where resetting `loss.py` will actually revert your experiment. The workflow assumes `loss.py`, `data.py`, and `test.py` are versioned files, not untracked scratch files.
-
 ## Running the agent
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
