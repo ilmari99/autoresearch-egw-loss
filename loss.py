@@ -199,7 +199,10 @@ class EGWConfig:
     # stays there; a small amount of noise lets the solver pick *some*
     # permutation-like mode. Seeded deterministically so the loss is
     # reproducible across re-runs at fixed input.
-    symmetry_break: float = 1.0
+    # NOTE: Disabled (0.0) because noise is neither permutation-equivariant
+    # nor batch-position-independent, breaking tests 8 and 17. sorted_row_init
+    # handles point-transitive codes without needing noise.
+    symmetry_break: float = 0.0
     symmetry_break_seed: int = 0
 
     # Multi-restart — the solver runs this many independent feature-warm-start
