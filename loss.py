@@ -258,7 +258,7 @@ def _structural_features(A: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
     row_max = torch.where(m_col, A_masked, neg_inf).amax(dim=2)
     row_min = torch.where(m_col, A_masked, pos_inf).amin(dim=2)
 
-    k = min(4, A.shape[-1])
+    k = min(8, A.shape[-1])
     A_for_topk = torch.where(m_col, A_masked, neg_inf)
     row_topk = A_for_topk.topk(k, dim=2).values            # (B, N, k)
 
