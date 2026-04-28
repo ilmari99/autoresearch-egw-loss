@@ -178,7 +178,8 @@ class EGWConfig:
     # accuracy on any tested code (verified: id/rot/perm identical to 6+
     # decimals). Mirror-descent outer loop typically converges in 30-60
     # iterations even in hard cases; we cap at 60.
-    max_outer: int = 25
+    max_outer: int = 25              # outer iters for the final (low-ε) stage
+    max_outer_early: int = 40        # outer iters for early (high-ε) annealing stages
     max_inner: int = 30
     tol: float = 1e-6
     min_outer: int = 5               # force at least this many outer iters per
@@ -603,15 +604,26 @@ def solve_egw_plan(
         best_val = None
         total_iters = 0
 
+        # Per-stage outer iteration counts: early (high-ε) stages run more
+        # iterations for better basin selection; final stage uses cfg.max_outer
+        # for better opt-recovery. With tol=0, all elements run exactly these
+        # steps → batch invariance is maintained.
+        n_stages = len(eps_schedule)
+        if n_stages > 1 and cfg.max_outer_early != cfg.max_outer:
+            mo_list = [cfg.max_outer_early] * (n_stages - 1) + [cfg.max_outer]
+        else:
+            mo_list = [cfg.max_outer] * n_stages
+
         def _run_schedule(T, log_T, sched, L_, mu_, nu_, fm2_):
             """Mirror-descent loop through an anneal schedule. L/mu/nu/fm2 are
             passed explicitly so we can call this with either the base batch
             (B, ...) or a K-fold tiled batch (K*B, ...) for batched restarts."""
             nonlocal total_iters
-            for eps in sched:
+            for i, eps in enumerate(sched):
+                mo = mo_list[i % len(mo_list)]
                 T, log_T, n_iter = _egw_solve_one_scale(
                     L_, mu_, nu_, fm2_, T, log_T,
-                    eps, cfg.max_outer, cfg.max_inner, cfg.tol, nx,
+                    eps, mo, cfg.max_inner, cfg.tol, nx,
                     min_outer=cfg.min_outer,
                     use_compile=cfg.use_compile,
                 )
