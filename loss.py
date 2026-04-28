@@ -225,7 +225,7 @@ class EGWConfig:
     # On point-transitive codes the scalar structural features collapse, but
     # the full sorted row of G is permutation-invariant per point and distinct
     # enough to recover inverse permutations. Cheap (one matmul + sort).
-    sorted_row_init: bool = True
+    sorted_row_init: bool = False
 
     # Compile the inner Sinkhorn projection via torch.compile. Cuts kernel-
     # launch overhead on GPU by fusing the fixed-iter Sinkhorn loop into a
