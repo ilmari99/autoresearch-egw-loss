@@ -36,7 +36,6 @@ The latent is always evaluated on its own; N and D are never added to it.
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import math
 import random
@@ -45,9 +44,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -59,7 +55,7 @@ from data import (
     quick_optimize,
     sample_spherical_code,
 )
-from egw_work.egw_loss import dsq_from_gram
+from loss import dsq_from_gram
 
 # =============================================================================
 # Configuration
@@ -151,12 +147,9 @@ def find_latest_ckpt(runs_dir: Path) -> Path:
 
 
 def load_encoder(ckpt_path: Path, device: str):
-    mod = importlib.import_module("train_autoencoder")
-    enc, _dec, cfg = mod.load_checkpoint(ckpt_path, device=device)
-    if isinstance(cfg, dict):
-        cfg = SimpleNamespace(**cfg)
-    elif not isinstance(cfg, SimpleNamespace):
-        cfg = SimpleNamespace(**vars(cfg))
+    from solution import load_checkpoint as _load_checkpoint
+    enc, _dec, cfg_obj = _load_checkpoint(ckpt_path, device=device)
+    cfg = SimpleNamespace(**vars(cfg_obj))
     return enc, cfg
 
 # =============================================================================
@@ -613,8 +606,11 @@ def analyze_trajectory(encoder, cfg, device: str, N: int, D: int) -> dict:
         _compute_analytics(s, 0)["coulomb_energy"] for s in states
     ], dtype=np.float32)
     latent_steps = np.linalg.norm(np.diff(latents, axis=0), axis=1).astype(np.float32)
+    mean, comps, explained = _fit_pca2(latents)
+    pca = (latents - mean) @ comps
     return {"N": N, "D": D,
-            "latents": latents, "energies": energies, "latent_steps": latent_steps}
+            "latents": latents, "energies": energies, "latent_steps": latent_steps,
+            "pca": pca, "pca_explained": explained.tolist()}
 
 
 def _fit_pca2(X: np.ndarray):
@@ -625,173 +621,8 @@ def _fit_pca2(X: np.ndarray):
     return mean, vh[:2].T, explained
 
 # =============================================================================
-# Plotting
+# (Plotting functions removed — this harness is plot-free)
 # =============================================================================
-
-def plot_probe_summary(r2_lin: np.ndarray, r2_mlp: np.ndarray, r2_nd: np.ndarray,
-                       names: list[str], out_path: Path) -> None:
-    """
-    Top panel : R² for latent-linear, latent-MLP, N,D-baseline (3 bars per target).
-    Bottom    : Δ R² = latent MLP − N,D baseline.
-    """
-    order  = np.argsort(r2_mlp)[::-1]
-    names_ = [names[i] for i in order]
-    lin_   = r2_lin[order]
-    mlp_   = r2_mlp[order]
-    nd_    = r2_nd[order]
-    delta  = mlp_ - nd_
-
-    CLIP = (-0.2, 1.05)
-    x = np.arange(len(names_))
-    w = 0.26
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
-
-    ax = axes[0]
-    ax.bar(x - w, lin_.clip(*CLIP), w, label="Latent (linear)", color="#4c72b0", alpha=0.9)
-    ax.bar(x,     mlp_.clip(*CLIP), w, label="Latent (MLP)",    color="#55a868", alpha=0.9)
-    ax.bar(x + w, nd_.clip(*CLIP),  w, label="N,D baseline",    color="#f28e2b", alpha=0.9)
-    ax.axhline(0, color="k", lw=0.8, ls="--", alpha=0.4)
-    ax.axhline(1, color="grey", lw=0.6, ls=":", alpha=0.3)
-    ax.set_ylim(CLIP)
-    ax.set_xticks(x); ax.set_xticklabels(names_, rotation=40, ha="right", fontsize=9)
-    ax.set_ylabel("Test R²")
-    ax.set_title("Probe recovery: latent vs N,D-only baseline  (sorted by MLP R²)", fontsize=10)
-    ax.legend(fontsize=9); ax.grid(axis="y", alpha=0.2)
-
-    ax2 = axes[1]
-    ax2.bar(x, delta, color=["#2ca02c" if v >= 0 else "#d62728" for v in delta], alpha=0.85)
-    ax2.axhline(0, color="k", lw=0.8, ls="--", alpha=0.4)
-    ax2.set_xticks(x); ax2.set_xticklabels(names_, rotation=40, ha="right", fontsize=9)
-    ax2.set_ylabel("Δ R²  (latent MLP − N,D baseline)")
-    ax2.set_title("Latent advantage over N,D baseline  (green = latent encodes beyond N and D)",
-                  fontsize=10)
-    ax2.grid(axis="y", alpha=0.2)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_latent_heatmap(dim_r2: np.ndarray, names: list[str], out_path: Path) -> None:
-    """
-    Heatmap: latent dimension (row) × target (column), value = univariate test R².
-    Reveals which dimensions encode which properties.
-    """
-    D, T  = dim_r2.shape
-    vmax  = float(np.percentile(np.clip(dim_r2, 0, 1), 98))
-
-    fig, ax = plt.subplots(figsize=(max(10, T * 0.7), max(6, D * 0.3)))
-    im = ax.imshow(dim_r2.clip(0, 1), aspect="auto", cmap="viridis", vmin=0, vmax=vmax)
-    fig.colorbar(im, ax=ax, label="Univariate test R²", shrink=0.7)
-    ax.set_xticks(np.arange(T)); ax.set_xticklabels(names, rotation=40, ha="right", fontsize=8.5)
-    ax.set_yticks(np.arange(D)); ax.set_yticklabels([f"z{d}" for d in range(D)], fontsize=7)
-    ax.set_xlabel("Target")
-    ax.set_ylabel("Latent dimension")
-    ax.set_title(
-        "Per-latent-dimension information content\n"
-        "Each cell = R² from a single latent dimension predicting that target alone",
-        fontsize=10,
-    )
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_trajectories(trajectories: list[dict], out_path: Path) -> None:
-    """
-    One row per (N, D).
-    Col 1 — 2-D PCA path of latent states (shared basis across all trajectories).
-    Col 2 — Latent PC1 vs Coulomb energy: does the dominant direction track progress?
-    """
-    all_latents = np.concatenate([t["latents"] for t in trajectories], 0)
-    mean, comps, explained = _fit_pca2(all_latents)
-    for t in trajectories:
-        t["pca"] = (t["latents"] - mean) @ comps
-
-    n    = len(trajectories)
-    cmap = plt.get_cmap("plasma")
-    fig, axes = plt.subplots(n, 2, figsize=(12, 4.5 * n), squeeze=False)
-
-    for row, traj in enumerate(trajectories):
-        N, D   = traj["N"], traj["D"]
-        pca    = traj["pca"]
-        steps  = np.arange(len(pca))
-        energy = traj["energies"]
-        vmax   = int(steps[-1])
-
-        # ── Col 1: PCA path ─────────────────────────────────────────────
-        ax = axes[row, 0]
-        ax.plot(pca[:, 0], pca[:, 1], color="#aaa", lw=1.0, alpha=0.7)
-        sc = ax.scatter(pca[:, 0], pca[:, 1], c=steps, cmap=cmap, s=40,
-                        vmin=0, vmax=vmax)
-        ax.scatter(pca[0, 0],  pca[0, 1],  marker="o", s=120,
-                   facecolor="none", edgecolor="#2ca02c", lw=2.5, label="start")
-        ax.scatter(pca[-1, 0], pca[-1, 1], marker="X", s=130,
-                   color="#d62728", label="end")
-        fig.colorbar(sc, ax=ax, shrink=0.75, label="step")
-        ax.set_xlabel(f"PC1  ({100*explained[0]:.1f}%)", fontsize=9)
-        ax.set_ylabel(f"PC2  ({100*explained[1]:.1f}%)", fontsize=9)
-        ax.set_title(
-            f"N={N}  D={D} — latent path  "
-            f"(path length = {traj['latent_steps'].sum():.3f})",
-            fontsize=9.5)
-        ax.legend(fontsize=8); ax.grid(alpha=0.2)
-
-        # ── Col 2: PC1 vs Coulomb energy ─────────────────────────────────
-        ax2 = axes[row, 1]
-        sc2 = ax2.scatter(pca[:, 0], energy, c=steps, cmap=cmap, s=50,
-                          vmin=0, vmax=vmax)
-        ax2.scatter(pca[0, 0],  energy[0],  marker="o", s=120,
-                    facecolor="none", edgecolor="#2ca02c", lw=2.5)
-        ax2.scatter(pca[-1, 0], energy[-1], marker="X", s=130, color="#d62728")
-        if pca[:, 0].std() > 1e-8 and energy.std() > 1e-8:
-            r = float(np.corrcoef(pca[:, 0], energy)[0, 1])
-            ax2.set_title(f"PC1 vs Coulomb energy  (r = {r:.3f})", fontsize=9.5)
-        else:
-            ax2.set_title("PC1 vs Coulomb energy", fontsize=9.5)
-        fig.colorbar(sc2, ax=ax2, shrink=0.75, label="step")
-        ax2.set_xlabel("Latent PC1", fontsize=9)
-        ax2.set_ylabel("Coulomb energy  (lower = better packing)", fontsize=9)
-        ax2.grid(alpha=0.2)
-
-    fig.suptitle(
-        f"Latent behaviour during Coulomb optimisation  ({TRAJECTORY_STEPS} steps)\n"
-        f"PCA fitted on all {n} trajectories combined",
-        fontsize=11, y=1.01,
-    )
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_class_pca(points_2d: np.ndarray, labels: list[str], explained: np.ndarray,
-                   out_path: Path) -> None:
-    """2D PCA scatter of encoded latent points, colored by spherical-code class."""
-    unique = list(dict.fromkeys(labels))
-    cmap = plt.get_cmap("tab20")
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    for i, label in enumerate(unique):
-        mask = np.array([l == label for l in labels], dtype=bool)
-        color = cmap(i % 20)
-        ax.scatter(
-            points_2d[mask, 0],
-            points_2d[mask, 1],
-            s=22,
-            alpha=0.75,
-            color=color,
-            edgecolors="none",
-            label=f"{label}  (n={int(mask.sum())})",
-        )
-
-    ax.set_xlabel(f"PC1 ({100 * explained[0]:.1f}% var)")
-    ax.set_ylabel(f"PC2 ({100 * explained[1]:.1f}% var)")
-    ax.set_title("Latent PCA across spherical-code classes")
-    ax.grid(alpha=0.2)
-    ax.legend(fontsize=8, loc="best")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
 
 
 def run_class_pca_diagnostic(cfg, encoder, archive: ArchiveCache | None,
@@ -802,11 +633,7 @@ def run_class_pca_diagnostic(cfg, encoder, archive: ArchiveCache | None,
 
     latents = encode_records(records, encoder, cfg, device)
     mean, comps, explained = _fit_pca2(latents)
-    points_2d = (latents - mean) @ comps
     labels = [r.source for r in records]
-
-    out_plot = output_dir / "class_pca_scatter.png"
-    plot_class_pca(points_2d, labels, explained, out_plot)
 
     counts: dict[str, int] = {}
     for label in labels:
@@ -881,6 +708,114 @@ def write_summary(ckpt_path: Path, output_dir: Path, names: list[str],
     (output_dir / "summary.txt").write_text("\n".join(lines) + "\n")
 
 # =============================================================================
+# Programmatic entry point (used by test_solution.py)
+# =============================================================================
+
+def run_probe_suite(
+    ckpt_path: "str | Path",
+    device: str,
+    output_dir: "str | Path | None" = None,
+) -> dict:
+    """Run the full latent probe suite and return results as a dict.
+
+    This is the programmatic entry point called by test_solution.py.
+    Results are also written as JSON files under *output_dir*.
+
+    Returns
+    -------
+    dict with keys:
+        target_names, r2_linear, r2_mlp, r2_nd_baseline,
+        per_dim_r2, trajectories, categories, categories_idx,
+        class_pca_payload, output_dir, ckpt_path
+    """
+    seed_all(SEED)
+    device = resolve_device(device)
+    ckpt_path = Path(ckpt_path)
+
+    if output_dir is None:
+        output_dir = OUTPUT_ROOT / ckpt_path.parent.name
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    encoder, cfg = load_encoder(ckpt_path, device)
+    archive = None
+    if ARCHIVE_DIR.exists():
+        archive = ArchiveCache(
+            str(ARCHIVE_DIR),
+            N_min=cfg.N_min, N_max=cfg.N_max,
+            D_min=cfg.D_min, D_max=cfg.D_max,
+            verbose=False,
+        )
+
+    records = build_records(cfg, archive)
+    r_tr, r_val, r_te = split_records(records)
+
+    names = _target_names(PROBE_EIGEN_COUNT)
+    categories_idx = build_target_categories(names)
+
+    Z_tr,  Y_tr  = encode_and_target(r_tr,  names, encoder, cfg, device)
+    Z_val, Y_val = encode_and_target(r_val, names, encoder, cfg, device)
+    Z_te,  Y_te  = encode_and_target(r_te,  names, encoder, cfg, device)
+    ND_tr  = nd_features(r_tr)
+    ND_te  = nd_features(r_te)
+
+    r2_lin  = run_linear_probe(Z_tr,  Y_tr, Z_te, Y_te)
+    r2_nd   = run_linear_probe(ND_tr, Y_tr, ND_te, Y_te)
+    dim_r2_ = per_dim_r2(Z_tr, Y_tr, Z_te, Y_te)
+    r2_mlp  = run_mlp_probe(Z_tr, Y_tr, Z_val, Y_val, Z_te, Y_te)
+
+    n_vals = _unique_ints(np.geomspace(cfg.N_min, cfg.N_max, PROBE_N_STEPS))
+    d_vals = _unique_ints(np.linspace(cfg.D_min, cfg.D_max, PROBE_D_STEPS))
+    traj_specs = sorted({
+        (n_vals[0],  d_vals[0]),  (n_vals[0],  d_vals[-1]),
+        (n_vals[-1], d_vals[0]),  (n_vals[-1], d_vals[-1]),
+    })[:4]
+    trajectories = [
+        analyze_trajectory(encoder, cfg, device, N, D) for N, D in traj_specs
+    ]
+
+    class_pca_payload = run_class_pca_diagnostic(
+        cfg, encoder, archive, device, output_dir
+    )
+
+    write_summary(
+        ckpt_path, output_dir, names,
+        r2_lin, r2_mlp, r2_nd, dim_r2_, trajectories,
+        categories_idx, class_pca_payload,
+    )
+
+    payload = {
+        "checkpoint":      str(ckpt_path),
+        "target_names":    names,
+        "categories":      {k: [names[i] for i in v] for k, v in categories_idx.items()},
+        "categories_idx":  {k: v for k, v in categories_idx.items()},
+        "r2_linear":       r2_lin.tolist(),
+        "r2_mlp":          r2_mlp.tolist(),
+        "r2_nd_baseline":  r2_nd.tolist(),
+        "per_dim_r2":      dim_r2_.tolist(),
+    }
+    (output_dir / "probe_results.json").write_text(json.dumps(payload, indent=2))
+
+    return {
+        "target_names":    names,
+        "r2_linear":       r2_lin.tolist(),
+        "r2_mlp":          r2_mlp.tolist(),
+        "r2_nd_baseline":  r2_nd.tolist(),
+        "per_dim_r2":      dim_r2_.tolist(),
+        "trajectories":    [
+            {k: (v.tolist() if hasattr(v, "tolist") else v)
+             for k, v in t.items()}
+            for t in trajectories
+        ],
+        "categories":      {k: [names[i] for i in v] for k, v in categories_idx.items()},
+        "categories_idx":  {k: v for k, v in categories_idx.items()},
+        "class_pca_payload": class_pca_payload,
+        "output_dir":      str(output_dir),
+        "ckpt_path":       str(ckpt_path),
+    }
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -948,47 +883,9 @@ def main() -> None:
     class_pca_payload = run_class_pca_diagnostic(cfg, encoder, archive, device, output_dir)
 
     # ── Save outputs ─────────────────────────────────────────────────────────
-    plot_probe_summary(r2_lin, r2_mlp, r2_nd, names, output_dir / "probe_summary.png")
-    plot_latent_heatmap(dim_r2_, names, output_dir / "latent_heatmap.png")
-    plot_trajectories(trajectories, output_dir / "trajectories.png")
     write_summary(ckpt_path, output_dir, names,
                   r2_lin, r2_mlp, r2_nd, dim_r2_, trajectories, categories,
                   class_pca_payload)
-
-    category_dir = output_dir / "categories"
-    category_dir.mkdir(parents=True, exist_ok=True)
-    for category, idxs in categories.items():
-        cat_names = [names[i] for i in idxs]
-        cat_r2_lin = r2_lin[idxs]
-        cat_r2_mlp = r2_mlp[idxs]
-        cat_r2_nd = r2_nd[idxs]
-        cat_dim_r2 = dim_r2_[:, idxs]
-
-        plot_probe_summary(
-            cat_r2_lin,
-            cat_r2_mlp,
-            cat_r2_nd,
-            cat_names,
-            category_dir / f"probe_summary_{category}.png",
-        )
-        plot_latent_heatmap(
-            cat_dim_r2,
-            cat_names,
-            category_dir / f"latent_heatmap_{category}.png",
-        )
-
-        cat_payload = {
-            "checkpoint": str(ckpt_path),
-            "category": category,
-            "target_names": cat_names,
-            "r2_linear": cat_r2_lin.tolist(),
-            "r2_mlp": cat_r2_mlp.tolist(),
-            "r2_nd_baseline": cat_r2_nd.tolist(),
-            "per_dim_r2": cat_dim_r2.tolist(),
-        }
-        (category_dir / f"probe_results_{category}.json").write_text(
-            json.dumps(cat_payload, indent=2)
-        )
 
     payload = {
         "checkpoint":     str(ckpt_path),
@@ -1002,9 +899,7 @@ def main() -> None:
         "r2_nd_baseline": r2_nd.tolist(),
         "per_dim_r2":     dim_r2_.tolist(),
     }
-    (output_dir / "probe_results.json").write_text(
-        json.dumps(payload, indent=2))
-
+    (output_dir / "probe_results.json").write_text(json.dumps(payload, indent=2))
     print(f"Saved to {output_dir}")
 
 

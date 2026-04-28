@@ -1,72 +1,96 @@
 # autoresearch
 
-![teaser](progress.png)
-
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
-
-The setup here has been retargeted from short-horizon model training to short-horizon **loss-function research**. An agent edits [loss.py](loss.py), runs [test.py](test.py), checks whether the aggregate `loss_suitability` score improved, and keeps or discards the change. The evaluation harness also prints per-test diagnostics so the agent can see *why* a loss improved or regressed.
+The setup here is **autoencoder architecture research** for spherical codes.
+An agent edits [`solution.py`](solution.py) (and optionally [`loss.py`](loss.py)),
+runs [`test_solution.py`](test_solution.py), checks whether `final_score` improved,
+and keeps or discards the change. Training runs for exactly 10 minutes; the harness
+averages and prints the finite scalar diagnostics returned by `train_one_step(...)`
+during the run, then runs one fixed evaluation pass and the latent probe suite at the
+end before printing a scorecard. The probe has a 5-minute cap.
 
 ## How it works
 
-The repo is deliberately kept small and only really has four files that matter:
+The repo has a small set of files:
 
-- **`loss.py`** — the single file the agent edits. It contains the loss implementation and solver details. **This file is edited and iterated on by the agent**.
-- **`data.py`** — shared data-loading, sampling, perturbation, and optimisation helpers used by the evaluation harness. **This file is read for context but not modified during the experiment loop**.
-- **`test.py`** — the fixed evaluation harness. It runs a suite of loss-property tests, prints a scorecard, and emits the single optimization target `loss_suitability`. **This file is not modified during the experiment loop**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+- **`solution.py`** — the primary file the agent edits. Must export the public API:
+  `Config`, `SphereCodeEncoder`, `SphereCodeDecoder`, `build_training_state`,
+  `train_one_step`, `build_val_loss_fn`, `save_checkpoint`, `load_checkpoint`.
+  Everything else — architecture, loss functions, training strategy — is up to the
+  agent. For each trial, the agent should also set `Config.run_name` to
+  `exp<n>_<name>` with the trial number and a short label. **This file is edited by the agent**.
+- **`loss.py`** — loss implementation. The agent may freely edit or replace this.
+  **The agent may edit this file**.
+- **`test_solution.py`** — the fixed evaluation harness. Trains for 10 minutes, logs
+  averaged scalar diagnostics returned by `solution.py` during the run, runs one fixed
+  evaluation pass and the latent probe suite at the end, prints a scorecard, and emits
+  the machine-readable footer.
+  **Do not modify during the experiment loop**.
+- **`data.py`** — data pipeline: archive loading, perturbation, sampling. **Read-only**.
+- **`evaluation.py`** — fixed end-of-run evaluation metrics. **Read-only**.
+- **`latent_test_bed.py`** — linear and MLP probe suite for latent quality assessment.
+  **Read-only**.
+- **`diagnostics.py`** — logging and diagnostic computations. **Read-only**.
+- **`program.md`** — instructions for the autonomous agent.
 
-By design, evaluation runs under a **fixed 10-minute time budget**. The metric is **loss_suitability** — lower is better. It is a bounded weighted aggregate over the full property suite in [test.py](test.py), with fundamental properties like identity, differentiability, bounded gradients, optimisation recovery, permutation equivariance, padding invariance, and batch invariance carrying the highest weight.
-
-The per-test scorecard includes a `score` column showing each test's weighted contribution to the final `loss_suitability`, so the agent can see exactly where the aggregate is coming from without relying on VRAM bookkeeping.
+The metric is **`final_score`** — higher is better (range 0–1).  It is the mean of
+`clip(max(R²_linear, R²_mlp), 0, 1)` over all probe targets.  A score of 1.0 means the
+latent predicts all targets perfectly.
 
 ## Quick start
 
-**Requirements:** Python 3.11+, [uv](https://docs.astral.sh/uv/), and an NVIDIA GPU with a CUDA 12.8 compatible driver for the default setup. The current [pyproject.toml](pyproject.toml) pins a CUDA-enabled PyTorch wheel.
+**Requirements:** Python 3.11+, [uv](https://docs.astral.sh/uv/), NVIDIA GPU with CUDA
+12.8+ driver.
 
 ```bash
-
-# 1. Install uv project manager (if you don't already have it)
+# Install uv (if needed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. Install dependencies
+# Install dependencies
 uv sync
 
-# 3. Manually run the evaluation harness
-uv run test.py
+# Run the evaluation harness (10-minute training + final evaluation + probe suite)
+uv run test_solution.py
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+Extract the key metrics from a log file:
+
+```bash
+grep "^final_score:\|^train_seconds:\|^total_seconds:\|^status:\|^steps_run:\|^ckpt:" run.log
+```
 
 ## Running the agent
 
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+Point an agent at `program.md`:
 
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+Hi, have a look at program.md and let's kick off a new experiment! Let's do the setup first.
 ```
-
-The `program.md` file is essentially a super lightweight "skill".
 
 ## Project structure
 
 ```
-loss.py         — loss implementation and solver (agent modifies this)
-data.py         — shared benchmark helpers (read-only during experiments)
-test.py         — fixed evaluation harness and aggregate scoring
-program.md      — agent instructions
-pyproject.toml  — dependencies
+solution.py          — solver module: Config, encoder, decoder, training step (agent edits)
+loss.py              — Entropic Gromov-Wasserstein OT loss (agent may edit)
+test_solution.py     — fixed evaluator: 10-min training + final evaluation + probe scorecard
+data.py              — data pipeline (read-only)
+evaluation.py        — end-of-run evaluation metrics (read-only)
+latent_test_bed.py   — latent probe suite with run_probe_suite() API (read-only)
+diagnostics.py       — logging utilities (read-only)
+program.md           — agent instructions
+pyproject.toml       — dependencies
+autoresearch-runs/   — local per-trial diagnostics for later analysis (keep untracked)
 ```
-
-## Design choices
-
-- **Single file to modify.** The agent only touches `loss.py`. `data.py` and `test.py` are fixed support files during the experiment loop. This keeps the scope manageable and diffs reviewable.
-- **Fixed evaluation budget.** `test.py` enforces a hard 10-minute wall-clock budget. This makes experiments directly comparable and prevents the agent from "winning" by making evaluation arbitrarily expensive.
-- **Weighted bounded scoring.** `loss_suitability` is a capped weighted aggregate, so one catastrophic subtest cannot dominate the whole score while still being visible in the scorecard.
-- **Per-test diagnostics.** The harness prints the raw property measurements, per-test penalty breakdown, and per-test score contribution, so the agent can optimize with signal rather than blindly hill-climbing a scalar.
+- **Focused editable surface.** The agent edits `solution.py` and optionally `loss.py`; the harness and support code stay fixed during the experiment loop.
+- **Fixed run profile.** `test_solution.py` enforces 10 minutes of training, one fixed evaluation pass at the end, and a 5-minute cap for the final probe.
+- **Per-trial run naming.** The agent should update `Config.run_name` in `solution.py` to `exp<n>_<name>` on each trial so `autoresearch-runs/` stays organized.
+- **Solution-defined training diagnostics.** During the run, the harness averages and prints whatever finite scalar diagnostics `train_one_step(...)` returns, so the solver can decide what signals it needs.
+- **Probe-based score.** `final_score` is the mean of `clip(max(R²_linear, R²_mlp), 0, 1)` across probe targets, with the full scorecard printed at the end.
 
 ## Platform support
 
-The compact benchmark profile in [test.py](test.py) is meant to complete within the 10-minute budget on a reasonable GPU. If you want a broader but slower sweep, run `uv run test.py --stress` manually, but the autonomous loop should normally optimize the default compact profile.
+The default harness in [test_solution.py](test_solution.py) is meant to complete with a
+10-minute training budget, one final evaluation pass, and up to 5 minutes of probing on
+a reasonable GPU.
 
 ## Notable forks
 

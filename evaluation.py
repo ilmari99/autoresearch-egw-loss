@@ -122,10 +122,138 @@ def build_val_codes(cfg) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Validation diagnostics helpers
+# ---------------------------------------------------------------------------
+
+def _module_grad_norm(module: torch.nn.Module) -> float:
+    grads = [p.grad.data for p in module.parameters() if p.grad is not None]
+    if not grads:
+        return 0.0
+    total = torch.stack([g.norm(2) ** 2 for g in grads]).sum()
+    return total.sqrt().item()
+
+
+def _param_grad_norm(param_or_module) -> float:
+    if isinstance(param_or_module, torch.nn.Parameter):
+        return param_or_module.grad.norm().item() if param_or_module.grad is not None else 0.0
+    return _module_grad_norm(param_or_module)
+
+
+def _component_grad_norms(model, prefix: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if hasattr(model, "diagnostic_submodules"):
+        for name, sub in model.diagnostic_submodules().items():
+            out[f"val_grad_{prefix}_{name}"] = _param_grad_norm(sub)
+    return out
+
+
+def _cumulative_rank(var_ratio: torch.Tensor, threshold: float) -> int:
+    if var_ratio.numel() == 0:
+        return 0
+    cdf = torch.cumsum(var_ratio, dim=0)
+    idx = torch.nonzero(cdf >= threshold, as_tuple=False)
+    if idx.numel() == 0:
+        return int(var_ratio.numel())
+    return int(idx[0].item() + 1)
+
+
+def _summarise_group_losses(per_sample_losses: list[float], values: list[int], key: str) -> list[dict]:
+    buckets: dict[int, list[float]] = {}
+    for value, loss in zip(values, per_sample_losses):
+        buckets.setdefault(int(value), []).append(float(loss))
+    rows = [
+        {
+            key: int(value),
+            "mean": float(np.mean(losses)),
+            "std": float(np.std(losses)),
+            "min": float(np.min(losses)),
+            "max": float(np.max(losses)),
+            "count": int(len(losses)),
+        }
+        for value, losses in buckets.items()
+    ]
+    rows.sort(key=lambda row: (row["mean"], row["max"]), reverse=True)
+    return rows
+
+
+def _latent_stats(Z_all: torch.Tensor) -> dict:
+    Z_all = Z_all.float()
+    Z_c = Z_all - Z_all.mean(dim=0, keepdim=True)
+    per_dim_std = Z_all.std(dim=0, unbiased=False)
+    sv = torch.linalg.svdvals(Z_c)
+    eig = sv.square()
+    eig_sum = eig.sum()
+    var_ratio = eig / eig_sum.clamp_min(1e-12)
+    nz = var_ratio[var_ratio > 1e-12]
+    entropy_rank = torch.exp(-(nz * torch.log(nz)).sum()).item() if nz.numel() else 0.0
+    participation = (
+        eig_sum.square() / eig.square().sum().clamp_min(1e-12)
+    ).item() if eig.numel() else 0.0
+
+    pair_dists = torch.pdist(Z_all)
+    topk = min(8, int(var_ratio.numel()))
+    pca_spectrum = [float(v) for v in var_ratio[:topk].tolist()]
+    return {
+        "val_latnorm": Z_all.norm(dim=-1).mean().item(),
+        "val_latstd": per_dim_std.mean().item(),
+        "val_latstd_min": per_dim_std.min().item(),
+        "val_latstd_max": per_dim_std.max().item(),
+        "val_latpdist": pair_dists.mean().item() if pair_dists.numel() else 0.0,
+        "val_latdead": (per_dim_std < 1e-4).float().mean().item(),
+        "val_entropy_rank": entropy_rank,
+        "val_rank": int(torch.linalg.matrix_rank(Z_c).item()),
+        "val_pca_rank_95": _cumulative_rank(var_ratio, 0.95),
+        "val_pca_rank_99": _cumulative_rank(var_ratio, 0.99),
+        "val_pca_participation": participation,
+        "val_pca_spectrum": pca_spectrum,
+    }
+
+
+def _validation_gradient_stats(
+    enc_model,
+    dec_model,
+    val_codes: list,
+    cfg,
+    device,
+    *,
+    loss_fn: Callable,
+) -> dict[str, float]:
+    enc_model.zero_grad(set_to_none=True)
+    dec_model.zero_grad(set_to_none=True)
+
+    total_items = max(len(val_codes), 1)
+    per_sample_loss = getattr(loss_fn, "per_sample", None)
+
+    for i in range(0, len(val_codes), cfg.batch_size):
+        batch = val_codes[i:i + cfg.batch_size]
+        x, mask, Ds, Ns = pad_batch(batch, cfg.D_max, cfg.N_max)
+        x, mask, Ds, Ns = [t.to(device) for t in (x, mask, Ds, Ns)]
+        z = enc_model(x, mask, Ds)
+        pred, pred_mask = dec_model(z, Ns, Ds)
+        if per_sample_loss is not None:
+            losses = per_sample_loss(pred, x, pred_mask, mask)
+            loss = losses.sum() / total_items
+        else:
+            loss = loss_fn(pred, x, pred_mask, mask) * (x.shape[0] / total_items)
+        loss.backward()
+
+    grad_stats = {
+        **_component_grad_norms(enc_model, "enc"),
+        **_component_grad_norms(dec_model, "dec"),
+    }
+    grad_stats["val_grad_total"] = math.sqrt(
+        sum(float(value) ** 2 for value in grad_stats.values())
+    )
+
+    enc_model.zero_grad(set_to_none=True)
+    dec_model.zero_grad(set_to_none=True)
+    return grad_stats
+
+
+# ---------------------------------------------------------------------------
 # Full evaluation pass
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
 def evaluate(
     enc_model,
     dec_model,
@@ -145,69 +273,88 @@ def evaluate(
         loss_fn(pred, target, pred_mask, target_mask) -> scalar
     """
     enc_model.eval(); dec_model.eval()
-    agg = dict(egw=0.0, lat_norm=0.0, lat_std=0.0,
-               lat_pdist=0.0, lat_dead=0.0, n=0)
+    agg = dict(egw=0.0, n=0)
     inv_perm = inv_rot = lip_pert = 0.0
     n_inv = 0
     all_z = []
+    all_losses: list[float] = []
+    all_Ds: list[int] = []
+    all_Ns: list[int] = []
+    per_sample_loss = getattr(loss_fn, "per_sample", None)
 
-    for i in range(0, len(val_codes), cfg.batch_size):
-        batch = val_codes[i:i + cfg.batch_size]
-        x, mask, Ds, Ns = pad_batch(batch, cfg.D_max, cfg.N_max)
-        x, mask, Ds, Ns = [t.to(device) for t in (x, mask, Ds, Ns)]
-        z = enc_model(x, mask, Ds)
-        all_z.append(z.detach().cpu())
-        pred, pred_mask = dec_model(z, Ns, Ds)
-        agg["egw"] += loss_fn(pred, x, pred_mask, mask).item() * x.shape[0]
-        agg["lat_norm"] += z.norm(dim=-1).mean().item() * x.shape[0]
-        if z.shape[0] > 1:
-            agg["lat_std"] += z.std(dim=0).mean().item() * x.shape[0]
-            agg["lat_pdist"] += torch.pdist(z).mean().item() * x.shape[0]
-            agg["lat_dead"] += (z.std(dim=0) < 1e-4).float().mean().item() * x.shape[0]
-        agg["n"] += x.shape[0]
+    with torch.no_grad():
+        for i in range(0, len(val_codes), cfg.batch_size):
+            batch = val_codes[i:i + cfg.batch_size]
+            x, mask, Ds, Ns = pad_batch(batch, cfg.D_max, cfg.N_max)
+            x, mask, Ds, Ns = [t.to(device) for t in (x, mask, Ds, Ns)]
+            z = enc_model(x, mask, Ds)
+            all_z.append(z.detach().cpu())
+            pred, pred_mask = dec_model(z, Ns, Ds)
+            batch_loss_mean = loss_fn(pred, x, pred_mask, mask).item()
 
-        # Invariance checks on first batch element
-        x0, m0, D0, N0 = x[:1], mask[:1], Ds[:1], Ns[:1]
-        N_i, D_i = int(N0.item()), int(D0.item())
-        perm = torch.randperm(N_i, device=device)
-        x0p = x0.clone(); x0p[0, :N_i] = x0[0, perm]
-        R = random_orthogonal(D_i, device=device)
-        x0r = x0.clone(); x0r[0, :N_i, :D_i] = x0[0, :N_i, :D_i] @ R
-        eps = 1e-3
-        delta = torch.randn_like(x0) * eps
-        delta[:, :, D_i:] = 0; delta[:, N_i:, :] = 0
-        x0e = x0 + delta
-        x0e[0, :N_i, :D_i] /= x0e[0, :N_i, :D_i].norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        z0 = enc_model(x0, m0, D0)
-        inv_perm += (z0 - enc_model(x0p, m0, D0)).abs().max().item()
-        inv_rot += (z0 - enc_model(x0r, m0, D0)).abs().max().item()
-        dx = (x0 - x0e).norm().item()
-        if dx > 0:
-            lip_pert += (z0 - enc_model(x0e, m0, D0)).norm().item() / dx
-        n_inv += 1
+            if per_sample_loss is not None:
+                batch_losses = per_sample_loss(pred, x, pred_mask, mask)
+                all_losses.extend(float(v) for v in batch_losses.detach().cpu().tolist())
+            else:
+                all_losses.extend([batch_loss_mean] * x.shape[0])
 
-    Z_all = torch.cat(all_z, dim=0).float()
-    Z_c = Z_all - Z_all.mean(dim=0)
-    sv = torch.linalg.svdvals(Z_c)
-    p = (sv ** 2) / ((sv ** 2).sum() + 1e-12)
-    # Perplexity of the normalised singular-value spectrum — a variance-
-    # concentration measure, not an information-capacity measure. A rank-1
-    # score is compatible with many linearly-recoverable directions if
-    # their eigenvalues are small but non-zero.
-    entropy_rank = torch.exp(-(p[p > 1e-12] * torch.log(p[p > 1e-12])).sum()).item()
-    num_rank = torch.linalg.matrix_rank(Z_c).item()
+            all_Ds.extend(int(v) for v in Ds.detach().cpu().tolist())
+            all_Ns.extend(int(v) for v in Ns.detach().cpu().tolist())
+            agg["egw"] += batch_loss_mean * x.shape[0]
+            agg["n"] += x.shape[0]
+
+            # Invariance checks on first batch element
+            x0, m0, D0, N0 = x[:1], mask[:1], Ds[:1], Ns[:1]
+            N_i, D_i = int(N0.item()), int(D0.item())
+            perm = torch.randperm(N_i, device=device)
+            x0p = x0.clone(); x0p[0, :N_i] = x0[0, perm]
+            R = random_orthogonal(D_i, device=device)
+            x0r = x0.clone(); x0r[0, :N_i, :D_i] = x0[0, :N_i, :D_i] @ R
+            eps = 1e-3
+            delta = torch.randn_like(x0) * eps
+            delta[:, :, D_i:] = 0; delta[:, N_i:, :] = 0
+            x0e = x0 + delta
+            x0e[0, :N_i, :D_i] /= x0e[0, :N_i, :D_i].norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            z0 = enc_model(x0, m0, D0)
+            inv_perm += (z0 - enc_model(x0p, m0, D0)).abs().max().item()
+            inv_rot += (z0 - enc_model(x0r, m0, D0)).abs().max().item()
+            dx = (x0 - x0e).norm().item()
+            if dx > 0:
+                lip_pert += (z0 - enc_model(x0e, m0, D0)).norm().item() / dx
+            n_inv += 1
+
+    Z_all = torch.cat(all_z, dim=0)
+    latent_stats = _latent_stats(Z_all)
+    loss_np = np.array(all_losses, dtype=np.float64)
+    loss_by_D = _summarise_group_losses(all_losses, all_Ds, "D")
+    loss_by_N = _summarise_group_losses(all_losses, all_Ns, "N")
+    sample_rows = [
+        {"loss": float(loss), "N": int(N), "D": int(D)}
+        for loss, N, D in zip(all_losses, all_Ns, all_Ds)
+    ]
+    sample_rows.sort(key=lambda row: row["loss"], reverse=True)
+
+    grad_stats = _validation_gradient_stats(
+        enc_model,
+        dec_model,
+        val_codes,
+        cfg,
+        device,
+        loss_fn=loss_fn,
+    )
 
     out = {
         "val_egw": agg["egw"] / agg["n"],
-        "val_latnorm": agg["lat_norm"] / agg["n"],
-        "val_latstd": agg["lat_std"] / agg["n"],
-        "val_latpdist": agg["lat_pdist"] / agg["n"],
-        "val_latdead": agg["lat_dead"] / agg["n"],
-        "val_entropy_rank": entropy_rank,
-        "val_rank": num_rank,
+        "val_loss_std": float(loss_np.std()),
+        "val_loss_p95": float(np.percentile(loss_np, 95)),
         "inv_perm": inv_perm / n_inv,
         "inv_rot": inv_rot / n_inv,
         "lip_pert": lip_pert / n_inv,
+        "val_worst_cases": sample_rows[:5],
+        "val_loss_by_D": loss_by_D[:8],
+        "val_loss_by_N": loss_by_N[:8],
+        **latent_stats,
+        **grad_stats,
     }
 
     # Add a validation-friendly fixed-(N,D) discrimination probe.  This is
