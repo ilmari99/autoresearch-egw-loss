@@ -805,13 +805,15 @@ def egw_gram_loss(
     # target graph and to let the solver reuse the same tensor.
     G_t = (target_m @ target_m.transpose(-1, -2)).detach()   # (B, M, M)
 
-    # Forward solve: uncompiled for numerically accurate T* (gradient depends on this).
+    # Both solves: compiled + tol=0 (fixed max_outer steps) for:
+    # - perfect batch invariance (each element runs exactly max_outer steps)
+    # - maintained symmetry (forward and reverse use identical cfg → L(A,B)=L(B,A))
+    cfg_compiled = replace(cfg, use_compile=True, tol=0.0)
     info = solve_egw_plan(
-        G_p.detach(), G_t, pred_mask, target_mask, cfg=cfg,
+        G_p.detach(), G_t, pred_mask, target_mask, cfg=cfg_compiled,
     )
     T_star = info["T_star"]
     valid_mask = info["valid_mask"]
-    cfg_compiled = replace(cfg, use_compile=True)
 
     # Per-batch GW value with T* treated as a constant. We rebuild L from the
     # *differentiable* G_p (gradient flows through pred) and detached G_t.
