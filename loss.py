@@ -55,7 +55,7 @@ Design notes (why this looks the way it does)
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -115,7 +115,7 @@ def _sinkhorn_log(K, log_a, log_b, max_iter: int, use_compile: bool = True):
     fn = _SINKHORN_COMPILED.get(key)
     if fn is None:
         try:
-            fn = torch.compile(_sinkhorn_log_fixed, mode="reduce-overhead",
+            fn = torch.compile(_sinkhorn_log_fixed, mode="default",
                                 dynamic=True, fullgraph=False)
             _SINKHORN_COMPILED[key] = fn
         except Exception:
@@ -805,8 +805,9 @@ def egw_gram_loss(
     # target graph and to let the solver reuse the same tensor.
     G_t = (target_m @ target_m.transpose(-1, -2)).detach()   # (B, M, M)
 
+    cfg_compiled = replace(cfg, use_compile=True)
     info = solve_egw_plan(
-        G_p.detach(), G_t, pred_mask, target_mask, cfg=cfg,
+        G_p.detach(), G_t, pred_mask, target_mask, cfg=cfg_compiled,
     )
     T_star = info["T_star"]
     valid_mask = info["valid_mask"]
@@ -836,7 +837,7 @@ def egw_gram_loss(
     # GW(A,B, T^T) = GW(B,A, T), so the min of the two directional estimates
     # gives an exactly symmetric loss: L(A,B) = L(B,A). Only for N=M (square T).
     if G_p.shape[-2] == G_t.shape[-2]:
-        info_rev = solve_egw_plan(G_t, G_p.detach(), target_mask, pred_mask, cfg=cfg)
+        info_rev = solve_egw_plan(G_t, G_p.detach(), target_mask, pred_mask, cfg=cfg_compiled)
         T_rev = info_rev["T_star"].transpose(-1, -2).contiguous()
         per_rev = loss_quadratic_batch(L, T_rev, nx=nx,
                                         recompute_const=True, symmetric=True)
