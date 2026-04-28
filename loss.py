@@ -830,7 +830,19 @@ def egw_gram_loss(
 
     per_sample = loss_quadratic_batch(L, T_star, nx=nx,
                                        recompute_const=True, symmetric=True)
-    per_sample = per_sample.clamp(min=0.0)  # GW loss is always ≥ 0 by definition
+    per_sample = per_sample.clamp(min=0.0)
+
+    # Symmetric solver: also run solve in the reverse direction (source↔target).
+    # GW(A,B, T^T) = GW(B,A, T), so the min of the two directional estimates
+    # gives an exactly symmetric loss: L(A,B) = L(B,A). Only for N=M (square T).
+    if G_p.shape[-2] == G_t.shape[-2]:
+        info_rev = solve_egw_plan(G_t, G_p.detach(), target_mask, pred_mask, cfg=cfg)
+        T_rev = info_rev["T_star"].transpose(-1, -2).contiguous()
+        per_rev = loss_quadratic_batch(L, T_rev, nx=nx,
+                                        recompute_const=True, symmetric=True)
+        per_rev = per_rev.clamp(min=0.0)
+        per_sample = torch.minimum(per_sample, per_rev)
+        valid_mask = valid_mask | info_rev["valid_mask"]
 
     # Zero-gradient fallback for non-converged samples.
     gate = valid_mask.to(per_sample.dtype).detach()
