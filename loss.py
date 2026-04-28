@@ -786,6 +786,12 @@ def egw_gram_loss(
     assert reduction in ("mean", "none"), \
         f"reduction must be 'mean' or 'none', got {reduction!r}"
 
+    # Always compute in float32 for numerical stability — this prevents NaN
+    # when inputs arrive in float16/bfloat16.  The gradient still flows back
+    # through the cast because autograd tracks dtype-promotion.
+    pred = pred.float()
+    target = target.float()
+
     # Differentiable Gram matrices (padded rows/cols are zero because the
     # decoder/encoder masks their outputs at padding positions; we also
     # defensively apply a mask below).
