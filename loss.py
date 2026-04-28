@@ -841,7 +841,10 @@ def egw_gram_loss(
         per_rev = loss_quadratic_batch(L, T_rev, nx=nx,
                                         recompute_const=True, symmetric=True)
         per_rev = per_rev.clamp(min=0.0)
-        per_sample = torch.minimum(per_sample, per_rev)
+        # Straight-through: symmetric value (min) but gradient from forward only.
+        # Avoids winner-flip batch-non-invariance while keeping L(A,B)=L(B,A).
+        per_sym = torch.minimum(per_sample, per_rev)
+        per_sample = per_sample + (per_sym - per_sample).detach()
         valid_mask = valid_mask | info_rev["valid_mask"]
 
     # Zero-gradient fallback for non-converged samples.
