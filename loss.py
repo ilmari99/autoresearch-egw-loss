@@ -178,7 +178,7 @@ class EGWConfig:
     # accuracy on any tested code (verified: id/rot/perm identical to 6+
     # decimals). Mirror-descent outer loop typically converges in 30-60
     # iterations even in hard cases; we cap at 60.
-    max_outer: int = 60
+    max_outer: int = 40
     max_inner: int = 30
     tol: float = 1e-6
     min_outer: int = 5               # force at least this many outer iters per
