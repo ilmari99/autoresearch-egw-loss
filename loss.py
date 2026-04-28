@@ -165,7 +165,7 @@ class EGWConfig:
     # spherical codes (where D² is nearly constant off-diagonal) still escape
     # the uniform-plan fixed point.  Larger eps is fine for generic point
     # clouds — this just prevents entropy from dominating on regular codes.
-    epsilon_rel: float = 0.02        # eps = epsilon_rel * median(D²)
+    epsilon_rel: float = 0.025       # eps = epsilon_rel * median(D²)
     epsilon_abs_min: float = 1e-4
     epsilon_abs_max: float = 0.2     # previously 1.0 — too loose on regular Gram
     # Multi-scale annealing: solve at eps_anneal_start * eps first, then at eps.
