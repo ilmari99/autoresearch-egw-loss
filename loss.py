@@ -169,7 +169,7 @@ class EGWConfig:
     epsilon_abs_min: float = 1e-4
     epsilon_abs_max: float = 0.2     # previously 1.0 — too loose on regular Gram
     # Multi-scale annealing: solve at eps_anneal_start * eps first, then at eps.
-    eps_anneal_start: float = 4.0
+    eps_anneal_start: float = 6.0
     eps_anneal_steps: int = 3
 
     # Iteration budget.  Sinkhorn inner projection: empirically converges in
