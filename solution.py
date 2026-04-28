@@ -101,15 +101,27 @@ class Config:
     contrastive_subsample: int = -1
 
     # EGW solver knobs
-    egw_n_restarts: int = 1
     egw_epsilon_rel: float = 0.02
-    egw_symmetry_break: float = 1.0
-    egw_max_inner: int = 20
-    egw_max_outer: int = 60
+    egw_epsilon_abs_min: float = 1e-4
+    egw_epsilon_abs_max: float = 0.2
+    egw_eps_anneal_start: float = 7.0
     egw_eps_anneal_steps: int = 3
+    egw_max_outer: int = 60
+    egw_max_outer_early: int = 40
+    egw_max_inner: int = 20
+    egw_tol: float = 1e-6
+    egw_min_outer: int = 5
+    egw_early_exit_rel: float = 1e-6
+    egw_warmstart: bool = True
+    egw_symmetry_break: float = 1.0
+    egw_symmetry_break_seed: int = 0
+    egw_n_restarts: int = 1
     egw_identity_init: bool = True
     egw_sorted_row_init: bool = True
     egw_use_compile: bool = True
+    egw_marg_err_threshold_rel: float = 1e9
+    egw_marg_err_threshold_max: float = 1e9
+    egw_min_t_deviation: float = 0.0
 
     # Optim
     lr: float = 3e-4
@@ -549,14 +561,26 @@ def denoising_smoothness(
 def _make_egw_cfg(cfg: Config) -> EGWConfig:
     return EGWConfig(
         epsilon_rel=cfg.egw_epsilon_rel,
-        max_inner=cfg.egw_max_inner,
-        max_outer=cfg.egw_max_outer,
+        epsilon_abs_min=cfg.egw_epsilon_abs_min,
+        epsilon_abs_max=cfg.egw_epsilon_abs_max,
+        eps_anneal_start=cfg.egw_eps_anneal_start,
         eps_anneal_steps=cfg.egw_eps_anneal_steps,
-        n_restarts=cfg.egw_n_restarts,
+        max_outer=cfg.egw_max_outer,
+        max_outer_early=cfg.egw_max_outer_early,
+        max_inner=cfg.egw_max_inner,
+        tol=cfg.egw_tol,
+        min_outer=cfg.egw_min_outer,
+        early_exit_rel=cfg.egw_early_exit_rel,
+        warmstart=cfg.egw_warmstart,
         symmetry_break=cfg.egw_symmetry_break,
+        symmetry_break_seed=cfg.egw_symmetry_break_seed,
+        n_restarts=cfg.egw_n_restarts,
         identity_init=cfg.egw_identity_init,
         sorted_row_init=cfg.egw_sorted_row_init,
         use_compile=cfg.egw_use_compile,
+        marg_err_threshold_rel=cfg.egw_marg_err_threshold_rel,
+        marg_err_threshold_max=cfg.egw_marg_err_threshold_max,
+        min_t_deviation=cfg.egw_min_t_deviation,
     )
 
 
