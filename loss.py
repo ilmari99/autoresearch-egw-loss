@@ -830,6 +830,7 @@ def egw_gram_loss(
 
     per_sample = loss_quadratic_batch(L, T_star, nx=nx,
                                        recompute_const=True, symmetric=True)
+    per_sample = per_sample.clamp(min=0.0)  # GW loss is always ≥ 0 by definition
 
     # Zero-gradient fallback for non-converged samples.
     gate = valid_mask.to(per_sample.dtype).detach()
